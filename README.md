@@ -1,5 +1,7 @@
 # BoundlessBPE
 
+[![CI](https://github.com/kensho-technologies/fastboundlessbpe/actions/workflows/ci.yml/badge.svg)](https://github.com/kensho-technologies/fastboundlessbpe/actions/workflows/ci.yml)
+
 A fast Rust implementation of the BoundlessBPE tokenizer with Python bindings, plus an
 identical pure-Python implementation that is only ~2.7x slower and may be more accessible.
 
