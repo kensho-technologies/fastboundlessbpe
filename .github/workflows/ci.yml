@@ -37,9 +37,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install build and test dependencies
-        run: python -m pip install --upgrade pip maturin pytest numpy
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest numpy
       - name: Build and install the extension
-        run: maturin develop --release
+        # pip uses the maturin build backend from pyproject.toml; unlike
+        # `maturin develop`, it does not require an activated virtualenv.
+        run: python -m pip install .
       - name: Run tests
         run: python -m pytest python/tests -v
