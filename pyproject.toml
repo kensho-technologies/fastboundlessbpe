@@ -12,7 +12,7 @@ authors = [
     {name = "Kensho Technologies, LLC."},
 ]
 license = {text = "Apache-2.0"}
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 keywords = ["tokenizer", "bpe", "boundlessbpe", "nlp", "tokenization"]
 classifiers = [
     "Development Status :: 4 - Beta",

@@ -399,7 +399,7 @@ deletions
 
 ## Requirements
 
-- **Python**: 3.8+
+- **Python**: 3.9+
 - **Rust**: 1.70+ (only needed for building the Rust extension from source)
 - **Python dependencies**: `regex`, `heapdict` (installed automatically)
 - **Rust dependencies**: `pyo3`, `fancy-regex`, `ahash`, `serde`, `serde_json`, `priority-queue`
