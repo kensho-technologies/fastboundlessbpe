@@ -1,0 +1,23 @@
+[licenses]
+# SPDX license identifiers explicitly allowed in the dependency tree.
+# All are OSI-approved permissive licenses compatible with distributing
+# this project under Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+]
+
+# priority-queue is "LGPL-3.0-or-later OR MPL-2.0" — we take the MPL-2.0 option.
+[[licenses.exceptions]]
+name = "priority-queue"
+allow = ["MPL-2.0"]
+
+# target-lexicon is "Apache-2.0 WITH LLVM-exception" (a pyo3 build-time dependency,
+# not linked into the distributed artifact). The LLVM exception is permissive.
+[[licenses.exceptions]]
+name = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
