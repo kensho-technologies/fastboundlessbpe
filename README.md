@@ -367,6 +367,21 @@ the slower Python `Tokenizer` here is fine: this is a one-time edit, not the inf
 
 **Correctness**: 100% identical results between Python and Rust implementations over 1,000,000 documents.
 
+### Parallel execution
+
+The Rust implementation uses Rayon for bounded corpus-scan batches and for sufficiently
+large `encode_batch` / `decode_batch` calls. Corpus reading remains ordered, and training
+applies document and byte limits in that order, so parallel work does not change which
+documents are included. Python bindings release the GIL while Rust performs loading,
+training, encoding, and decoding.
+
+Rayon uses its default worker count unless configured. Set `RAYON_NUM_THREADS` when the
+tokenizer shares a machine with other CPU-intensive work:
+
+```bash
+RAYON_NUM_THREADS=12 python examples/train_super.py ...
+```
+
 ## Model File Format
 
 BoundlessBPE uses `.model` files in a unified v2 format:

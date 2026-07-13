@@ -1,11 +1,14 @@
 // Copyright 2026-present Kensho Technologies, LLC.
 use ahash::{AHashMap, AHashSet};
+use rayon::prelude::*;
 use std::io::BufRead;
 
 use crate::byte_encoding::ByteEncoder;
 use crate::error::{TokenizerError, TokenizerResult};
 use crate::inference_data::InferenceData;
 use crate::vocabulary::Vocabulary;
+
+const PARALLEL_BATCH_MIN: usize = 32;
 
 /// Core BPE tokenizer implementation.
 ///
@@ -465,7 +468,7 @@ impl Tokenizer {
     ///
     /// Steps:
     /// 1. Pretokenize using regex
-    /// 2. Split each pretoken into individual bytes
+    /// 2. Return reachable pretokens directly, otherwise split into bytes
     /// 3. Apply merge/deletion operations (fast_merge_delete)
     /// 4. Apply supermerges (fast_supermerge)
     pub fn encode_ordinary_chunks(&self, text: &str, supercharge: bool) -> Vec<Vec<u8>> {
@@ -474,10 +477,24 @@ impl Tokenizer {
         // Pretokenize
         let text_chunks_str = words.pretokenizer.pretokenize(text);
 
-        // Convert to bytes and split into single bytes
+        // Check reachability before allocating one Vec per byte. The shortcut
+        // is semantically identical to the later fast_merge_delete check, but
+        // avoids the expansion-and-flattening work for common pretokens.
         let mut text_chunks: Vec<Vec<Vec<u8>>> = text_chunks_str
-            .iter()
-            .map(|ch| ch.as_bytes().iter().map(|&b| vec![b]).collect())
+            .into_iter()
+            .map(|chunk| {
+                let bytes = chunk.into_bytes();
+                let reachable = supercharge
+                    && self
+                        .reachable_vocab
+                        .as_ref()
+                        .is_some_and(|tokens| tokens.contains(&bytes));
+                if reachable {
+                    vec![bytes]
+                } else {
+                    bytes.into_iter().map(|byte| vec![byte]).collect()
+                }
+            })
             .collect();
 
         // Apply all regular merges and deletions
@@ -615,15 +632,20 @@ impl Tokenizer {
         texts: &[&str],
         allowed_special: &str,
     ) -> TokenizerResult<Vec<Vec<i32>>> {
-        texts
-            .iter()
-            .map(|text| self.encode(text, allowed_special))
-            .collect()
+        if texts.len() < PARALLEL_BATCH_MIN {
+            texts.iter().map(|text| self.encode(text, allowed_special)).collect()
+        } else {
+            texts.par_iter().map(|text| self.encode(text, allowed_special)).collect()
+        }
     }
 
     /// Decode multiple token ID sequences at once.
     pub fn decode_batch(&self, ids_list: &[Vec<i32>]) -> TokenizerResult<Vec<String>> {
-        ids_list.iter().map(|ids| self.decode(ids)).collect()
+        if ids_list.len() < PARALLEL_BATCH_MIN {
+            ids_list.iter().map(|ids| self.decode(ids)).collect()
+        } else {
+            ids_list.par_iter().map(|ids| self.decode(ids)).collect()
+        }
     }
 
     /// Get vocabulary size.

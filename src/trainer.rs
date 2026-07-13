@@ -2,9 +2,11 @@
 use std::time::Instant;
 use std::io::{BufRead, BufReader};
 use std::fs::File;
+use std::hash::Hash;
 
 use ahash::{AHashMap, AHashSet};
 use priority_queue::PriorityQueue;
+use rayon::prelude::*;
 
 use crate::byte_encoding::ByteEncoder;
 use crate::error::{TokenizerError, TokenizerResult};
@@ -12,6 +14,8 @@ use crate::inference_data::InferenceData;
 use crate::pretokenize::Pretokenizer;
 use crate::tokenizer::Tokenizer;
 use crate::vocabulary::Vocabulary;
+
+const SCAN_BATCH_DOCUMENTS: usize = 512;
 
 // ---------------------------------------------------------------------------
 // IndexGenerator
@@ -199,6 +203,108 @@ impl BaseBpeTrainer {
         Ok(())
     }
 
+    fn merge_count_maps<K>(target: &mut AHashMap<K, i64>, source: AHashMap<K, i64>)
+    where
+        K: Eq + Hash,
+    {
+        for (key, count) in source {
+            *target.entry(key).or_insert(0) += count;
+        }
+    }
+
+    fn parse_jsonl_text_batch(lines: &[String]) -> Vec<TokenizerResult<String>> {
+        // Keep batches ordered so the serial caller can apply num_lines and
+        // max_bytes exactly as before. Errors stay attached to their source
+        // line: a record after the cap must not fail a scan that would never
+        // have read it in the serial implementation.
+        lines
+            .par_iter()
+            .map(|line| {
+                let json: serde_json::Value = serde_json::from_str(line.trim_end())
+                    .map_err(TokenizerError::JsonError)?;
+                json["text"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| TokenizerError::ModelError("missing 'text' field".into()))
+            })
+            .collect()
+    }
+
+    fn collect_documents_until_max_bytes(
+        parsed_documents: Vec<TokenizerResult<String>>,
+        max_bytes: usize,
+        total_chars: &mut usize,
+        total_bytes: &mut usize,
+        documents_read: &mut usize,
+    ) -> TokenizerResult<(Vec<String>, bool)> {
+        let mut documents = Vec::with_capacity(parsed_documents.len());
+        for result in parsed_documents {
+            let text = result?;
+            *total_chars += text.len();
+            *total_bytes += text.len(); // approximate (UTF-8)
+            *documents_read += 1;
+            documents.push(text);
+            if *total_bytes >= max_bytes {
+                return Ok((documents, true));
+            }
+        }
+        Ok((documents, false))
+    }
+
+    fn tally_pretoken_batch(
+        pretokenizer: &Pretokenizer,
+        documents: &[String],
+    ) -> AHashMap<String, i64> {
+        documents
+            .par_iter()
+            .fold(AHashMap::new, |mut local_counts, text| {
+                for chunk in pretokenizer.pretokenize(text) {
+                    *local_counts.entry(chunk).or_insert(0) += 1;
+                }
+                local_counts
+            })
+            .reduce(AHashMap::new, |mut left, right| {
+                Self::merge_count_maps(&mut left, right);
+                left
+            })
+    }
+
+    fn add_superword_run(
+        counts: &mut AHashMap<Vec<Vec<u8>>, i64>,
+        run: &mut Vec<Vec<u8>>,
+    ) {
+        if run.len() >= 2 {
+            *counts.entry(std::mem::take(run)).or_insert(0) += 1;
+        } else {
+            run.clear();
+        }
+    }
+
+    fn tally_superword_batch(
+        pretokenizer: &Pretokenizer,
+        supermerge_eligible: &AHashSet<Vec<u8>>,
+        documents: &[String],
+    ) -> AHashMap<Vec<Vec<u8>>, i64> {
+        documents
+            .par_iter()
+            .fold(AHashMap::new, |mut local_counts, text| {
+                let mut run = Vec::new();
+                for chunk in pretokenizer.pretokenize(text) {
+                    if supermerge_eligible.contains(chunk.as_bytes()) {
+                        run.push(chunk.into_bytes());
+                    } else {
+                        Self::add_superword_run(&mut local_counts, &mut run);
+                    }
+                }
+                Self::add_superword_run(&mut local_counts, &mut run);
+                local_counts
+            })
+            .reduce(AHashMap::new, |mut left, right| {
+                Self::merge_count_maps(&mut left, right);
+                left
+            })
+    }
+
     // -----------------------------------------------------------------------
     // Pretokenization
     // -----------------------------------------------------------------------
@@ -218,52 +324,75 @@ impl BaseBpeTrainer {
         let mut chunk_tally: AHashMap<String, i64> = AHashMap::new();
         let mut total_bytes: usize = 0;
         let mut total_chars: usize = 0;
+        let mut documents_read: usize = 0;
 
         let f = File::open(filepath)
             .map_err(|e| TokenizerError::IoError(e))?;
-        let reader = BufReader::new(f);
+        let mut reader = BufReader::new(f);
+        let mut raw_batch = Vec::with_capacity(SCAN_BATCH_DOCUMENTS);
+        let mut source_lines = 0;
+        let mut reached_max_bytes = false;
 
-        for (i, line_result) in reader.lines().enumerate() {
-            if i >= num_lines {
-                break;
-            }
-            if verbose && i % 10000 == 0 {
-                println!(
-                    "document {} {:.3} {} {}",
-                    i,
-                    start.elapsed().as_secs_f64(),
-                    total_chars,
-                    total_bytes
-                );
-            }
-            let line = line_result.map_err(|e| TokenizerError::IoError(e))?;
-            let json: serde_json::Value = serde_json::from_str(line.trim_end())
-                .map_err(|e| TokenizerError::JsonError(e))?;
-            let text = json["text"]
-                .as_str()
-                .ok_or_else(|| TokenizerError::ModelError("missing 'text' field".into()))?;
-
-            for chunk in self.inf_data.pretokenizer.pretokenize(text) {
-                *chunk_tally.entry(chunk).or_insert(0) += 1;
-            }
-
-            total_chars += text.len();
-            total_bytes += text.len(); // approximate (UTF-8)
-
-            if total_bytes >= max_bytes {
-                if verbose {
-                    println!("at max_bytes {} {} {} {}", i, max_bytes, total_chars, total_bytes);
+        while source_lines < num_lines && !reached_max_bytes {
+            raw_batch.clear();
+            while source_lines < num_lines && raw_batch.len() < SCAN_BATCH_DOCUMENTS {
+                if verbose && source_lines % 10_000 == 0 {
+                    println!(
+                        "document {} {:.3} {} {}",
+                        source_lines,
+                        start.elapsed().as_secs_f64(),
+                        total_chars,
+                        total_bytes
+                    );
                 }
+                let mut line = String::new();
+                if reader.read_line(&mut line).map_err(TokenizerError::IoError)? == 0 {
+                    break;
+                }
+                raw_batch.push(line);
+                source_lines += 1;
+            }
+            if raw_batch.is_empty() {
                 break;
+            }
+
+            let (document_batch, reached_max) = Self::collect_documents_until_max_bytes(
+                Self::parse_jsonl_text_batch(&raw_batch),
+                max_bytes,
+                &mut total_chars,
+                &mut total_bytes,
+                &mut documents_read,
+            )?;
+            if reached_max {
+                reached_max_bytes = true;
+                if verbose {
+                    println!("at max_bytes {} {} {} {}", documents_read - 1, max_bytes, total_chars, total_bytes);
+                }
+            }
+            if !document_batch.is_empty() {
+                let local_counts = Self::tally_pretoken_batch(
+                    &self.inf_data.pretokenizer,
+                    &document_batch,
+                );
+                Self::merge_count_maps(&mut chunk_tally, local_counts);
             }
         }
 
-        // Sort descending by count
+        println!(
+            "phase 1 scan: documents={} bytes={} unique_pretokens={} elapsed={:.1}s",
+            documents_read,
+            total_bytes,
+            chunk_tally.len(),
+            start.elapsed().as_secs_f64(),
+        );
+
+        // A stable lexical tie-break keeps the aggregated representation
+        // deterministic even though Rayon combines local maps in parallel.
         let mut cnt_chk: Vec<(i64, Vec<u8>)> = chunk_tally
             .into_iter()
             .map(|(chk, cnt)| (cnt, chk.into_bytes()))
             .collect();
-        cnt_chk.sort_by(|a, b| b.0.cmp(&a.0));
+        cnt_chk.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
         if cnt_chk.is_empty() {
             println!("WARNING: no pre-tokenization chunks found!");
@@ -334,6 +463,7 @@ impl BaseBpeTrainer {
         let mut total_bytes: usize = 0;
         let mut total_chars: usize = 0;
         let mut counts: AHashMap<Vec<Vec<u8>>, i64> = AHashMap::new();
+        let mut documents_read: usize = 0;
 
         // Shortcut: precompute which pretokens (as raw bytes) are both
         // single-token after merges (reachable) AND in possible_superwords.
@@ -356,76 +486,82 @@ impl BaseBpeTrainer {
         }
 
         let f = File::open(filepath)
-            .map_err(|e| TokenizerError::IoError(e))?;
-        let reader = BufReader::new(f);
+            .map_err(TokenizerError::IoError)?;
+        let mut reader = BufReader::new(f);
+        let mut raw_batch = Vec::with_capacity(SCAN_BATCH_DOCUMENTS);
+        let mut source_lines = 0;
+        let mut reached_max_bytes = false;
 
-        for (i, line_result) in reader.lines().enumerate() {
-            if i >= num_lines {
+        // Reading stays serial to preserve source order and the exact byte cap.
+        // JSON parsing and the expensive regex/run tally execute in parallel for
+        // each bounded batch, avoiding unbounded corpus buffering.
+        while source_lines < num_lines && !reached_max_bytes {
+            raw_batch.clear();
+            while source_lines < num_lines && raw_batch.len() < SCAN_BATCH_DOCUMENTS {
+                if verbose && source_lines % 10_000 == 0 {
+                    println!(
+                        "document {} {:.3} {} {}",
+                        source_lines,
+                        start.elapsed().as_secs_f64(),
+                        total_chars,
+                        total_bytes
+                    );
+                }
+                let mut line = String::new();
+                if reader.read_line(&mut line).map_err(TokenizerError::IoError)? == 0 {
+                    break;
+                }
+                raw_batch.push(line);
+                source_lines += 1;
+            }
+            if raw_batch.is_empty() {
                 break;
             }
-            if verbose && i % 10000 == 0 {
-                println!(
-                    "document {} {:.3} {} {}",
-                    i,
-                    start.elapsed().as_secs_f64(),
-                    total_chars,
-                    total_bytes
-                );
-            }
-            let line = line_result.map_err(|e| TokenizerError::IoError(e))?;
-            let json: serde_json::Value = serde_json::from_str(line.trim_end())
-                .map_err(|e| TokenizerError::JsonError(e))?;
-            let text = json["text"]
-                .as_str()
-                .ok_or_else(|| TokenizerError::ModelError("missing 'text' field".into()))?;
 
-            let document_bytes: Vec<Vec<u8>> = self
-                .inf_data
-                .pretokenizer
-                .pretokenize(text)
-                .into_iter()
-                .map(|chunk| chunk.into_bytes())
-                .collect();
-
-            // Find runs of consecutive eligible pretokens directly,
-            // skipping the full merge replay.
-            let n = document_bytes.len();
-            let mut idx = 0;
-            while idx < n {
-                if !supermerge_eligible.contains(&document_bytes[idx]) {
-                    idx += 1;
-                    continue;
-                }
-                // start of a run
-                let mut end = idx + 1;
-                while end < n && supermerge_eligible.contains(&document_bytes[end]) {
-                    end += 1;
-                }
-                // need at least 2 consecutive eligible pretokens
-                if end - idx >= 2 {
-                    let superword_run: Vec<Vec<u8>> = document_bytes[idx..end].to_vec();
-                    *counts.entry(superword_run).or_insert(0) += 1;
-                }
-                idx = end;
-            }
-
-            total_chars += text.len();
-            total_bytes += text.len();
-
-            if total_bytes >= max_bytes {
+            let (document_batch, reached_max) = Self::collect_documents_until_max_bytes(
+                Self::parse_jsonl_text_batch(&raw_batch),
+                max_bytes,
+                &mut total_chars,
+                &mut total_bytes,
+                &mut documents_read,
+            )?;
+            if reached_max {
+                reached_max_bytes = true;
                 if verbose {
-                    println!("at max_bytes {} {} {} {}", i, max_bytes, total_chars, total_bytes);
+                    println!(
+                        "at max_bytes {} {} {} {}",
+                        documents_read - 1,
+                        max_bytes,
+                        total_chars,
+                        total_bytes
+                    );
                 }
-                break;
+            }
+
+            if !document_batch.is_empty() {
+                let local_counts = Self::tally_superword_batch(
+                    &self.inf_data.pretokenizer,
+                    &supermerge_eligible,
+                    &document_batch,
+                );
+                Self::merge_count_maps(&mut counts, local_counts);
             }
         }
 
-        // Sort descending by count
+        println!(
+            "phase 2 scan: documents={} bytes={} unique_runs={} elapsed={:.1}s",
+            documents_read,
+            total_bytes,
+            counts.len(),
+            start.elapsed().as_secs_f64(),
+        );
+
+        // Preserve deterministic chunk ordering after parallel aggregation.
         let mut cnt_chk: Vec<(i64, Vec<Vec<u8>>)> = counts
             .into_iter()
             .map(|(chk, cnt)| (cnt, chk))
             .collect();
-        cnt_chk.sort_by(|a, b| b.0.cmp(&a.0));
+        cnt_chk.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
         if cnt_chk.is_empty() {
             println!("WARNING: no superword pre-tokenization chunks found!");
@@ -632,8 +768,17 @@ impl BaseBpeTrainer {
             Self::get_stats(tokens, &mut pair_counts_dict, cnt);
         }
 
+        let pair_counts_heap = self.build_pair_heap(&pair_counts_dict);
+
+        (pair_counts_dict, pair_counts_heap)
+    }
+
+    fn build_pair_heap(
+        &self,
+        pair_counts: &AHashMap<(Vec<u8>, Vec<u8>), i64>,
+    ) -> PriorityQueue<(Vec<u8>, Vec<u8>), PairPriority> {
         let mut pair_counts_heap = PriorityQueue::new();
-        for (pair, &count) in &pair_counts_dict {
+        for (pair, &count) in pair_counts {
             let both_unlocked = self.is_unlocked(&pair.0) && self.is_unlocked(&pair.1);
             let priority = PairPriority {
                 neg_both_unlocked: -(both_unlocked as i32),
@@ -643,19 +788,7 @@ impl BaseBpeTrainer {
             pair_counts_heap.push(pair.clone(), priority);
         }
 
-        (pair_counts_dict, pair_counts_heap)
-    }
-
-    fn initial_pair_counts(
-        &mut self,
-        text_chunks: &[Vec<Vec<u8>>],
-        text_counts: &[i64],
-    ) {
-        let (_, heap) = self._calc_pair_counts(text_chunks, text_counts);
-        self.pair_counts = heap;
-
-        // token_to_pairs initialization removed — unlocking mechanism no longer needed.
-        // The count-based competition ensures parents are created before their supermerges.
+        pair_counts_heap
     }
 
     fn _calc_single_counts(
@@ -669,14 +802,6 @@ impl BaseBpeTrainer {
             }
         }
         single_counts
-    }
-
-    fn initial_single_counts(
-        &mut self,
-        text_chunks: &[Vec<Vec<u8>>],
-        text_counts: &[i64],
-    ) {
-        self.single_counts = Self::_calc_single_counts(text_chunks, text_counts);
     }
 
     fn _calc_token_locations(text_chunks: &[Vec<Vec<u8>>]) -> AHashMap<Vec<u8>, AHashSet<usize>> {
@@ -693,10 +818,6 @@ impl BaseBpeTrainer {
         token_locations
     }
 
-    fn initial_token_locations(&mut self, text_chunks: &[Vec<Vec<u8>>]) {
-        self.token_locations = Self::_calc_token_locations(text_chunks);
-    }
-
     fn _calc_whole_words(text_chunks: &[Vec<Vec<u8>>], text_counts: &[i64]) -> i64 {
         let mut whole_words: i64 = 0;
         for (tokens, &cnt) in text_chunks.iter().zip(text_counts.iter()) {
@@ -707,23 +828,45 @@ impl BaseBpeTrainer {
         whole_words
     }
 
-    fn initial_whole_words(
-        &mut self,
-        text_chunks: &[Vec<Vec<u8>>],
-        text_counts: &[i64],
-    ) {
-        self.whole_words = Self::_calc_whole_words(text_chunks, text_counts);
-    }
-
     fn initial_counts(
         &mut self,
         text_chunks: &[Vec<Vec<u8>>],
         text_counts: &[i64],
     ) {
-        self.initial_pair_counts(text_chunks, text_counts);
-        self.initial_single_counts(text_chunks, text_counts);
-        self.initial_whole_words(text_chunks, text_counts);
-        self.initial_token_locations(text_chunks);
+        let start = Instant::now();
+        let mut pair_counts = AHashMap::new();
+        let mut single_counts = AHashMap::new();
+        let mut token_locations: AHashMap<Vec<u8>, AHashSet<usize>> = AHashMap::new();
+        let mut whole_words = 0;
+
+        for (chunk_index, (tokens, &count)) in text_chunks.iter().zip(text_counts).enumerate() {
+            Self::get_stats(tokens, &mut pair_counts, count);
+            for token in tokens {
+                *single_counts.entry(token.clone()).or_insert(0) += count;
+            }
+            if tokens.len() == 1 {
+                whole_words += count;
+            }
+            let unique_tokens: AHashSet<&Vec<u8>> = tokens.iter().collect();
+            for token in unique_tokens {
+                token_locations
+                    .entry(token.clone())
+                    .or_default()
+                    .insert(chunk_index);
+            }
+        }
+
+        self.pair_counts = self.build_pair_heap(&pair_counts);
+        self.single_counts = single_counts;
+        self.token_locations = token_locations;
+        self.whole_words = whole_words;
+        println!(
+            "initial counts: pairs={} tokens={} locations={} elapsed={:.1}s",
+            self.pair_counts.len(),
+            self.single_counts.len(),
+            self.token_locations.len(),
+            start.elapsed().as_secs_f64(),
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2491,6 +2634,92 @@ mod tests {
             counts.get(&(vec![b'a'], vec![b'a'])).copied().unwrap_or(0),
             1
         );
+    }
+
+    #[test]
+    fn parallel_scan_tallies_match_serial_counting() {
+        let pretokenizer = Pretokenizer::new(None, None, None, None).unwrap();
+        let documents = vec![
+            "The quick brown fox.".to_string(),
+            "The quick brown fox jumps.".to_string(),
+            "Numbers 123 and symbols!".to_string(),
+        ];
+
+        let parallel_pretokens = BaseBpeTrainer::tally_pretoken_batch(&pretokenizer, &documents);
+        let mut serial_pretokens = AHashMap::new();
+        for document in &documents {
+            for chunk in pretokenizer.pretokenize(document) {
+                *serial_pretokens.entry(chunk).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(parallel_pretokens, serial_pretokens);
+
+        // Use a subset of the observed chunks so this also exercises runs
+        // ending at document boundaries and runs separated by ineligible text.
+        let eligible: AHashSet<Vec<u8>> = serial_pretokens
+            .keys()
+            .filter(|chunk| chunk.chars().any(char::is_alphabetic))
+            .map(|chunk| chunk.as_bytes().to_vec())
+            .collect();
+        let parallel_runs = BaseBpeTrainer::tally_superword_batch(
+            &pretokenizer,
+            &eligible,
+            &documents,
+        );
+        let mut serial_runs = AHashMap::new();
+        for document in &documents {
+            let mut run = Vec::new();
+            for chunk in pretokenizer.pretokenize(document) {
+                if eligible.contains(chunk.as_bytes()) {
+                    run.push(chunk.into_bytes());
+                } else {
+                    BaseBpeTrainer::add_superword_run(&mut serial_runs, &mut run);
+                }
+            }
+            BaseBpeTrainer::add_superword_run(&mut serial_runs, &mut run);
+        }
+        assert_eq!(parallel_runs, serial_runs);
+    }
+
+    #[test]
+    fn parallel_json_parsing_preserves_document_order() {
+        let lines = vec![
+            "{\"text\":\"first\"}\n".to_string(),
+            "{\"text\":\"second\"}\n".to_string(),
+            "{\"text\":\"third\"}\n".to_string(),
+        ];
+
+        assert_eq!(
+            BaseBpeTrainer::parse_jsonl_text_batch(&lines)
+                .into_iter()
+                .collect::<TokenizerResult<Vec<_>>>()
+                .unwrap(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn scan_ignores_parse_errors_after_the_byte_cap() {
+        let lines = vec![
+            "{\"text\":\"accepted\"}\n".to_string(),
+            "this is not JSON\n".to_string(),
+        ];
+        let mut total_chars = 0;
+        let mut total_bytes = 0;
+        let mut documents_read = 0;
+
+        let (documents, reached_cap) = BaseBpeTrainer::collect_documents_until_max_bytes(
+            BaseBpeTrainer::parse_jsonl_text_batch(&lines),
+            "accepted".len(),
+            &mut total_chars,
+            &mut total_bytes,
+            &mut documents_read,
+        )
+        .unwrap();
+
+        assert!(reached_cap);
+        assert_eq!(documents, vec!["accepted"]);
+        assert_eq!((total_chars, total_bytes, documents_read), (8, 8, 1));
     }
 
     #[test]

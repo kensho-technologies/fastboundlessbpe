@@ -38,79 +38,93 @@ impl PyTokenizer {
     }
 
     /// Load model from file
-    fn load(&mut self, model_file: &str) -> PyResult<()> {
-        self.inner
-            .load(model_file)
+    fn load(&mut self, py: Python<'_>, model_file: &str) -> PyResult<()> {
+        let model_file = model_file.to_owned();
+        py.allow_threads(|| self.inner.load(&model_file))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Encode text to token IDs (ignoring special tokens)
     #[pyo3(signature = (text, supercharge = true))]
-    fn encode_ordinary(&self, text: &str, supercharge: bool) -> PyResult<Vec<i32>> {
-        let vocab = self.inner.vocab.as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("vocab must be loaded"))?;
-        let tokens = self.inner.encode_ordinary_chunks(text, supercharge);
-        let mut ids = Vec::with_capacity(tokens.len());
-        for tok in &tokens {
-            let id = vocab.token_to_id.get(tok)
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("Token not found in vocabulary: {:?}", tok)
-                ))?;
-            ids.push(*id);
-        }
-        Ok(ids)
+    fn encode_ordinary(&self, py: Python<'_>, text: &str, supercharge: bool) -> PyResult<Vec<i32>> {
+        let text = text.to_owned();
+        py.allow_threads(|| {
+            let vocab = self.inner.vocab.as_ref()
+                .ok_or_else(|| TokenizerError::VocabularyError("vocab must be loaded".to_string()))?;
+            let tokens = self.inner.encode_ordinary_chunks(&text, supercharge);
+            tokens.into_iter().map(|token| {
+                vocab.token_to_id.get(&token).copied().ok_or_else(|| {
+                    TokenizerError::VocabularyError(format!("Token not found in vocabulary: {:?}", token))
+                })
+            }).collect::<Result<Vec<i32>, TokenizerError>>()
+        })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Encode text to token byte vectors
     #[pyo3(signature = (text, supercharge = true))]
-    fn encode_ordinary_chunks(&self, text: &str, supercharge: bool) -> PyResult<Vec<Vec<u8>>> {
-        Ok(self.inner.encode_ordinary_chunks(text, supercharge))
+    fn encode_ordinary_chunks(&self, py: Python<'_>, text: &str, supercharge: bool) -> PyResult<Vec<Vec<u8>>> {
+        let text = text.to_owned();
+        Ok(py.allow_threads(|| self.inner.encode_ordinary_chunks(&text, supercharge)))
     }
 
     /// Encode text with special token handling
     #[pyo3(signature = (text, allowed_special = "none_raise"))]
-    fn encode(&self, text: &str, allowed_special: &str) -> PyResult<Vec<i32>> {
-        self.inner
-            .encode(text, allowed_special)
+    fn encode(&self, py: Python<'_>, text: &str, allowed_special: &str) -> PyResult<Vec<i32>> {
+        let text = text.to_owned();
+        let allowed_special = allowed_special.to_owned();
+        py.allow_threads(|| self.inner.encode(&text, &allowed_special))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Encode multiple texts at once
     #[pyo3(signature = (texts, allowed_special = "none_raise"))]
-    fn encode_batch(&self, texts: Vec<&str>, allowed_special: &str) -> PyResult<Vec<Vec<i32>>> {
-        self.inner
-            .encode_batch(&texts, allowed_special)
+    fn encode_batch(
+        &self,
+        py: Python<'_>,
+        texts: Vec<&str>,
+        allowed_special: &str,
+    ) -> PyResult<Vec<Vec<i32>>> {
+        // Copy Python-owned strings before releasing the GIL. Rayon preserves
+        // input order when collecting from this indexed parallel iterator.
+        let texts: Vec<String> = texts.into_iter().map(str::to_owned).collect();
+        let allowed_special = allowed_special.to_owned();
+        py.allow_threads(|| {
+            let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            self.inner.encode_batch(&text_refs, &allowed_special)
+        })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Decode token IDs back to text
-    fn decode(&self, ids: Vec<i32>) -> PyResult<String> {
-        self.inner
-            .decode(&ids)
+    fn decode(&self, py: Python<'_>, ids: Vec<i32>) -> PyResult<String> {
+        py.allow_threads(|| self.inner.decode(&ids))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Decode token IDs to raw bytes
     fn decode_bytes<'py>(&self, py: Python<'py>, ids: Vec<i32>) -> PyResult<&'py PyBytes> {
-        let bytes = self
-            .inner
-            .decode_bytes(&ids)
+        let bytes = py.allow_threads(|| self.inner.decode_bytes(&ids))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(PyBytes::new(py, &bytes))
     }
 
     /// Decode multiple token ID sequences at once
-    fn decode_batch(&self, ids_list: Vec<Vec<i32>>) -> PyResult<Vec<String>> {
-        self.inner
-            .decode_batch(&ids_list)
+    fn decode_batch(&self, py: Python<'_>, ids_list: Vec<Vec<i32>>) -> PyResult<Vec<String>> {
+        py.allow_threads(|| self.inner.decode_batch(&ids_list))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Pretokenize text using the loaded model's pretokenizer
-    fn pretokenize(&self, text: &str) -> PyResult<Vec<String>> {
-        let words = self.inner.words.as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("model not loaded"))?;
-        Ok(words.pretokenizer.pretokenize(text))
+    fn pretokenize(&self, py: Python<'_>, text: &str) -> PyResult<Vec<String>> {
+        let text = text.to_owned();
+        py.allow_threads(|| {
+            let words = self.inner.words.as_ref().ok_or_else(|| {
+                TokenizerError::ModelError("model not loaded".to_string())
+            })?;
+            Ok(words.pretokenizer.pretokenize(&text))
+        })
+            .map_err(|e: TokenizerError| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Get vocabulary size
@@ -188,6 +202,7 @@ impl PyBpeTrainer {
     #[pyo3(signature = (tau, filepath, outprefix, num_lines, vocab_size, recalc, blowup, max_bytes = 1000000000, checkpoint_iterations = 8192, verbose = true, progress_interval = None, save_pretokens = None))]
     fn train(
         &mut self,
+        py: Python<'_>,
         tau: f64,
         filepath: &str,
         outprefix: &str,
@@ -202,11 +217,14 @@ impl PyBpeTrainer {
         save_pretokens: Option<&str>,
     ) -> PyResult<()> {
         let progress_interval = resolve_progress_interval(progress_interval, verbose);
-        self.inner
-            .train(
+        let filepath = filepath.to_owned();
+        let outprefix = outprefix.to_owned();
+        let save_pretokens = save_pretokens.map(str::to_owned);
+        py.allow_threads(|| {
+            self.inner.train(
                 tau,
-                filepath,
-                outprefix,
+                &filepath,
+                &outprefix,
                 num_lines,
                 vocab_size,
                 recalc,
@@ -215,8 +233,9 @@ impl PyBpeTrainer {
                 checkpoint_iterations,
                 verbose,
                 progress_interval,
-                save_pretokens,
+                save_pretokens.as_deref(),
             )
+        })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -259,6 +278,7 @@ impl PyBoundlessBpeTrainer {
     #[pyo3(signature = (filepath, outprefix, num_lines, recalc, word_model_file, max_bytes = 1000000000, checkpoint_iterations = 8192, verbose = true, progress_interval = None, save_pretokens = None, greedy_split = false, min_count = 15, max_ngram_len = 30))]
     fn train(
         &mut self,
+        py: Python<'_>,
         filepath: &str,
         outprefix: &str,
         num_lines: usize,
@@ -274,22 +294,27 @@ impl PyBoundlessBpeTrainer {
         max_ngram_len: usize,
     ) -> PyResult<()> {
         let progress_interval = resolve_progress_interval(progress_interval, verbose);
-        self.inner
-            .train(
-                filepath,
-                outprefix,
+        let filepath = filepath.to_owned();
+        let outprefix = outprefix.to_owned();
+        let word_model_file = word_model_file.to_owned();
+        let save_pretokens = save_pretokens.map(str::to_owned);
+        py.allow_threads(|| {
+            self.inner.train(
+                &filepath,
+                &outprefix,
                 num_lines,
                 recalc,
-                word_model_file,
+                &word_model_file,
                 max_bytes,
                 checkpoint_iterations,
                 verbose,
                 progress_interval,
-                save_pretokens,
+                save_pretokens.as_deref(),
                 greedy_split,
                 min_count,
                 max_ngram_len,
             )
+        })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -332,6 +357,7 @@ impl PySuperBpeTrainer {
     #[pyo3(signature = (filepath, outprefix, num_lines, vocab_size, recalc, word_model_file, max_bytes = 1000000000, checkpoint_iterations = 8192, verbose = true, progress_interval = None, save_pretokens = None, greedy_split = false, min_count = 15, max_ngram_len = 30))]
     fn train(
         &mut self,
+        py: Python<'_>,
         filepath: &str,
         outprefix: &str,
         num_lines: usize,
@@ -348,23 +374,28 @@ impl PySuperBpeTrainer {
         max_ngram_len: usize,
     ) -> PyResult<()> {
         let progress_interval = resolve_progress_interval(progress_interval, verbose);
-        self.inner
-            .train(
-                filepath,
-                outprefix,
+        let filepath = filepath.to_owned();
+        let outprefix = outprefix.to_owned();
+        let word_model_file = word_model_file.to_owned();
+        let save_pretokens = save_pretokens.map(str::to_owned);
+        py.allow_threads(|| {
+            self.inner.train(
+                &filepath,
+                &outprefix,
                 num_lines,
                 vocab_size,
                 recalc,
-                word_model_file,
+                &word_model_file,
                 max_bytes,
                 checkpoint_iterations,
                 verbose,
                 progress_interval,
-                save_pretokens,
+                save_pretokens.as_deref(),
                 greedy_split,
                 min_count,
                 max_ngram_len,
             )
+        })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
