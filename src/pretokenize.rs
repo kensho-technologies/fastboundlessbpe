@@ -70,7 +70,7 @@ impl Pretokenizer {
         script_specific_scripts: Option<&[String]>,
         merge_pattern: Option<&str>,
     ) -> TokenizerResult<Self> {
-        // gpt4o_regex() returns a String that would be dropped, so we need to own it
+        // Keep the generated default pattern in scope while compiling it.
         let main_regex_owned;
         let main_regex_str = if let Some(mr) = main_regex {
             mr

@@ -3,11 +3,11 @@
 [![CI](https://github.com/kensho-technologies/fastboundlessbpe/actions/workflows/ci.yml/badge.svg)](https://github.com/kensho-technologies/fastboundlessbpe/actions/workflows/ci.yml)
 
 A fast Rust implementation of the BoundlessBPE tokenizer with Python bindings, plus an
-identical pure-Python implementation that is only ~2.7x slower and may be more accessible.
+identical pure-Python implementation for environments where a Rust extension is unavailable.
 
 The package provides:
 
-- A **Rust inference engine** with Python bindings (`FastTokenizer`) — ~2.7x faster.
+- A **Rust inference engine** with Python bindings (`FastTokenizer`) and parallel batch inference.
 - A **pure-Python inference** implementation (`Tokenizer`) with identical results, no Rust toolchain needed.
 - **Training routines** for word-level BPE, BoundlessBPE, and SuperBPE models (both Rust and Python).
 
@@ -19,6 +19,7 @@ fastboundlessbpe/
 │   ├── lib.rs                     # PyO3 bindings and module exports
 │   ├── tokenizer.rs               # Core BPE inference logic
 │   ├── trainer.rs                 # Training engine (BPE, BoundlessBPE, SuperBPE)
+│   ├── training_types.rs          # Compact TokenId training state and chunk operations
 │   ├── vocabulary.rs              # Token vocabulary management
 │   ├── inference_data.rs          # Merge/deletion operations data
 │   ├── pretokenize.rs             # Regex-based text pretokenization
@@ -95,7 +96,7 @@ pip install -e ".[test,dev]"
 
 There are two inference implementations with identical results:
 
-- **`FastTokenizer`** (Rust with Python bindings) -- ~2.7x faster
+- **`FastTokenizer`** (Rust with Python bindings and parallel batch execution)
 - **`Tokenizer`** (pure Python) -- no Rust toolchain needed
 
 Both share the same core API:
@@ -357,15 +358,106 @@ the slower Python `Tokenizer` here is fine: this is a one-time edit, not the inf
 
 ## Performance
 
-**Inference benchmarks** (1,000,000 documents from minipile):
+**Current Rust vs Python batch-inference reference** (same current BPE model, 20,000 generated
+texts, 971,282 output tokens, median of three isolated runs):
 
-```text
-   Overall speedup:    2.66x
-   Total time: Python 3,569s vs Rust 1,341s
-   Throughput: Python 1,644,124 chars/sec vs Rust 4,375,271 chars/sec
-```
+| Implementation | Rayon workers | Encode time | Throughput | Peak RSS |
+|---|---:|---:|---:|---:|
+| `Tokenizer` (pure Python) | serial | 2.784 s | 348,891 tokens/s | 33.1 MiB |
+| `FastTokenizer` (current Rust) | 4 | **0.208 s** | **4,670,657 tokens/s** | 48.9 MiB |
+
+This is a 13.39x encoding speedup for this batch-oriented workload. The Rust result includes four
+Rayon workers; its higher RSS includes the extension and worker overhead. Single-text latency,
+model, text length, CPU topology, and `RAYON_NUM_THREADS` can change the result, so this table is
+a reference configuration rather than a universal claim.
 
 **Correctness**: 100% identical results between Python and Rust implementations over 1,000,000 documents.
+
+### Trainer migration and thread-scaling benchmark
+
+The table below compares the original serial trainer (`c2dce31`) with the Rayon-only trainer
+(`1c4d41d`) and the current TokenId trainer. Every model file was byte-identical across versions
+and thread counts. Peak RSS is for the whole Python process, including the input batch and Python
+runtime. The SuperBPE fixture is intentionally run-heavy to exercise the phase-2 aggregation map.
+
+| Workload | Original serial | Rayon, 1 worker | Rayon, 4 workers | TokenId, 1 worker | TokenId, 4 workers |
+|---|---:|---:|---:|---:|---:|
+| BPE training: 20k JSONL documents, 240k unique pretokens | 4.102 s, 218.2 MiB | 3.970 s, 225.7 MiB | 3.896 s, 228.3 MiB | 1.130 s, 197.7 MiB | **0.756 s, 201.2 MiB** |
+| SuperBPE training: 500k JSONL documents, 302,999 unique runs | 3.476 s, 269.4 MiB | 4.543 s, 321.4 MiB | 3.353 s, 322.1 MiB | 2.961 s, 151.4 MiB | **1.784 s, 151.7 MiB** |
+
+At four workers, the TokenId trainer is 5.43x faster than the original BPE trainer and 1.95x
+faster than the original SuperBPE trainer in these fixtures. The run-heavy SuperBPE case also
+uses 43.7% less peak RSS than the original and 52.9% less than the Rayon-only trainer.
+
+For this 12-logical-core host, four workers improve the run-heavy SuperBPE scan by 1.35x for the
+Rayon-only trainer and 1.66x for the TokenId trainer. Peak RSS is nearly flat across one and four
+workers; the phase-2 unique-run map, rather than Rayon worker count, is the dominant memory cost.
+Thread count is workload- and machine-dependent, so use these as a tuning starting point rather
+than a universal default.
+
+### Technical trainer changes
+
+The migration is internal to Rust training. It does not change the Python API, model-file format,
+vocabulary numbering, or inference representation.
+
+```rust
+type TokenId = u32;
+type Pair = (TokenId, TokenId);
+type Chunk = Vec<TokenId>;
+```
+
+| Area | Before | Current implementation |
+|---|---|---|
+| Token storage | Every trainer map/chunk owned `Vec<u8>` tokens, often repeatedly. | `TokenArena` owns each byte string once and returns a stable, append-only `TokenId`. It also records the first merge parent for deletion reconstruction. |
+| Corpus chunks | `Vec<Vec<Vec<u8>>>` through trainer initialization and rewrites. | Chunks are `Vec<TokenId>` after the raw corpus/trainer boundary. Initial BPE interning assigns IDs in byte order. |
+| Hot trainer maps | Single counts, pair heap keys, pair adjacency, locations, and unlock state used byte-vector keys. | Those structures use `TokenId`/`Pair` keys. Only heap priority metadata retains byte copies, solely to preserve lexical equal-count tie-breaking. |
+| Initial counting | One byte-backed pass built counts and locations. | Fixed-size Rayon batches build worker-local ID count maps, then reduce in batch order for deterministic location indices. |
+| Merge/delete updates | Byte-token rewrites and byte-backed pair deltas. | Non-overlapping merge and blow-up operate on IDs. Workers mutate disjoint chunks in place and reduce local `Pair` deltas before the trainer commits locations/counts. |
+| Sparse rewrites | The parallel path could scan the full corpus for a small candidate set. | Small or sparse candidate sets update serially; large dense sets use Rayon with a candidate bitmap. |
+| SuperBPE phase 2 | `AHashMap<Vec<Vec<u8>>, i64>` stored each unique run with nested byte allocations. | Word-vocabulary tokens are pre-interned; the scan stores `AHashMap<Vec<TokenId>, i64>`. Eligibility is an ID set rather than cloned token bytes. |
+| Optional n-grams | N-gram and greedy-split maps used nested byte-vector chunks. | Both use `AHashMap<Vec<TokenId>, i64>` / `AHashSet<Vec<TokenId>>`. |
+
+The heap still compares the selected pair’s underlying bytes when frequencies tie. This is
+intentional: `TokenId`s reflect creation order, while the previous trainer selected equal-count
+pairs in lexical byte order. Keeping that ordering is what allows the current trainer to produce
+byte-identical models.
+
+### Parallel execution
+
+The Rust implementation uses Rayon for bounded corpus-scan batches and for sufficiently
+large `encode_batch` / `decode_batch` calls. Corpus reading remains ordered, and training
+applies document and byte limits in that order, so parallel work does not change which
+documents are included. Python bindings release the GIL while Rust performs loading,
+training, encoding, and decoding.
+
+Rayon uses its default worker count unless configured. Set `RAYON_NUM_THREADS` when the
+tokenizer shares a machine with other CPU-intensive work:
+
+```bash
+RAYON_NUM_THREADS=12 python examples/train_super.py ...
+```
+
+### Compact trainer representation and memory scaling
+
+Rust training uses a private, append-only `TokenId` (`u32`) arena. Token bytes and their merge
+parents are stored once; the hot trainer structures—chunks, pair counts, token locations, unlock
+state, and rewrite deltas—store IDs instead of cloned `Vec<u8>` values. Vocabulary indices are
+not used as training IDs because BoundlessBPE deletions can renumber vocabulary entries.
+
+For word-level BPE, raw pretokens are interned once at the corpus/trainer boundary. For the
+SuperBPE second pass, word-vocabulary tokens are interned before scanning, so the phase-2 map is
+`AHashMap<Vec<TokenId>, i64>` rather than a nested byte-vector map. Optional n-gram counting and
+greedy splitting use the same ID chunks. Merge selection still breaks equal-frequency ties by
+token bytes, preserving historical deterministic model output.
+
+Dense rewrite sets are processed in parallel; sparse sets are updated serially to avoid scanning
+the complete corpus and allocating a corpus-sized candidate bitmap for a small change.
+
+This is an in-memory trainer, not an out-of-core one. `max_bytes` limits input consumed, but does
+not impose a fixed memory ceiling: peak memory still depends on the number and total ID-length of
+unique chunks/runs, active pairs, and—when `--greedy-split` is enabled—the number of retained
+n-grams. Use a representative pilot corpus and conservative `--min-count` / `--max-ngram-len`
+settings before attempting multi-gigabyte training.
 
 ## Model File Format
 
