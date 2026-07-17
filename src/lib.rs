@@ -9,6 +9,7 @@ pub mod inference_data;
 pub mod tokenizer;
 pub mod trainer;
 pub mod error;
+mod training_types;
 
 pub use tokenizer::Tokenizer;
 pub use trainer::{BpeTrainer, BoundlessBpeTrainer, SuperBpeTrainer};

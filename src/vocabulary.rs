@@ -168,7 +168,7 @@ impl Vocabulary {
     // Training methods
     // -----------------------------------------------------------------------
 
-    /// Create vocabulary with 243 valid UTF-8 single bytes.
+    /// Create the vocabulary's initial 243 byte tokens.
     /// Excludes 0xC0, 0xC1, and 0xF5-0xFF.
     pub fn create_initial() -> Self {
         let mut vocab = Self::new();

@@ -355,7 +355,7 @@ impl Tokenizer {
     /// Find runs of possible superwords and apply supermerge_tokens to each run.
     fn fast_supermerge(&self, text_chunks: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
         if self.superwords.is_none() {
-            // No superwords model, just flatten
+            // Without a superword model, flatten the chunks.
             return text_chunks.iter().flatten().cloned().collect();
         }
 
@@ -477,9 +477,9 @@ impl Tokenizer {
         // Pretokenize
         let text_chunks_str = words.pretokenizer.pretokenize(text);
 
-        // Check reachability before allocating one Vec per byte. The shortcut
-        // is semantically identical to the later fast_merge_delete check, but
-        // avoids the expansion-and-flattening work for common pretokens.
+        // Check reachability before allocating one Vec per byte. This is
+        // equivalent to the later fast_merge_delete check and avoids expansion
+        // and flattening for common pretokens.
         let mut text_chunks: Vec<Vec<Vec<u8>>> = text_chunks_str
             .into_iter()
             .map(|chunk| {
@@ -500,7 +500,7 @@ impl Tokenizer {
         // Apply all regular merges and deletions
         self.fast_merge_delete(&mut text_chunks, supercharge);
 
-        // Apply supermerges (or just flatten)
+        // Apply supermerges, or flatten when none are configured.
         self.fast_supermerge(&text_chunks)
     }
 
