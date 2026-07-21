@@ -236,6 +236,15 @@ class Tokenizer():
 
                 print(f"Two-pass mode: {len(self.words.merges)} word merges, {len(self.superwords.merges)} supermerges")
 
+        # Resolve deletion parts against the final vocabulary. This repairs
+        # "double deletion" cases where a deleted token's replacement parts
+        # reference another token that was itself deleted (see
+        # InferenceData.resolve_deletion_parts).
+        vocab_tokens = set(self.vocab.token_to_id.keys())
+        self.words.resolve_deletion_parts(vocab_tokens)
+        if self.superwords is not None:
+            self.superwords.resolve_deletion_parts(vocab_tokens)
+
         # Set up possible superwords (for supermerge optimization)
         self._setup_superwords()
 

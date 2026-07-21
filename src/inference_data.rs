@@ -176,6 +176,81 @@ impl InferenceData {
             .expect("couldn't find replacement parts for deleted token")
     }
 
+    /// Expand deletion_parts recursively so every replacement piece is in the vocabulary.
+    ///
+    /// A token can be deleted more than once when a later merge recreates it (a
+    /// "double deletion"). When that happens the recorded replacement parts of one
+    /// deleted token may themselves reference another token that was deleted and is
+    /// no longer in the final vocabulary. For example (tau small, blowup=false):
+    ///
+    /// ```text
+    /// idx1 merge (c,r)->cr      idx3 delete cr  -> [c, r]
+    /// idx2 merge (cr,y)->cry    idx5 delete cry -> [cr, y]   // parts reference cr
+    /// ```
+    ///
+    /// Here `cry` records parts `[cr, y]`, but `cr` was itself deleted at idx3 and is
+    /// not in the vocabulary. During encoding, `prev_ind` has already advanced past the
+    /// merge/deletion that would resolve `cr` (both have index < 5), so the stray `cr`
+    /// can never be turned into vocabulary tokens and ID lookup fails.
+    ///
+    /// The only round-trippable interpretation under the monotonic-index algorithm is to
+    /// expand a deleted token's parts until every piece is in the vocabulary, bottoming
+    /// out at single bytes (which are always present). This is applied after loading and
+    /// repairs models that were trained before the fix.
+    ///
+    /// Only blowup=false models can hit the bug. In blowup=false mode a deletion records
+    /// its *merge pair* as the replacement, and either half can be an intermediate
+    /// multi-byte token that was itself deleted (the `cr` above). In blowup=true mode a
+    /// deletion records the token's individual *bytes* — there is no intermediate token to
+    /// strand, and the recursion here bottoms out immediately. Termination and correctness
+    /// rest on the base-alphabet invariant: the 243 bytes that can appear in valid UTF-8
+    /// are never deleted (deleting one would make some valid text unencodable), so every
+    /// expansion is guaranteed to reach in-vocab pieces. This method is therefore a no-op
+    /// for blowup=true; it is still called for both so the invariant holds by construction
+    /// rather than by assumption.
+    pub fn resolve_deletion_parts(&mut self, vocab_tokens: &ahash::AHashSet<Vec<u8>>) {
+        // Raw parts as recorded at deletion time (merge pair or single bytes).
+        let raw_parts = self.deletion_parts.clone();
+        let mut resolved: AHashMap<Vec<u8>, Vec<Vec<u8>>> = AHashMap::new();
+
+        // Iterative post-order expansion via an explicit stack (avoids borrow issues
+        // and deep recursion). Parts are always strictly shorter than their token, so
+        // this terminates.
+        fn resolve(
+            tok: &[u8],
+            vocab_tokens: &ahash::AHashSet<Vec<u8>>,
+            raw_parts: &AHashMap<Vec<u8>, Vec<Vec<u8>>>,
+            resolved: &mut AHashMap<Vec<u8>, Vec<Vec<u8>>>,
+        ) -> Vec<Vec<u8>> {
+            if vocab_tokens.contains(tok) {
+                return vec![tok.to_vec()];
+            }
+            if let Some(out) = resolved.get(tok) {
+                return out.clone();
+            }
+            // Cycle guard: memoize a self-reference before recursing.
+            resolved.insert(tok.to_vec(), vec![tok.to_vec()]);
+            let out = match raw_parts.get(tok) {
+                // Not a known deleted token yet not in vocab: fall back to bytes.
+                None => tok.iter().map(|&b| vec![b]).collect(),
+                Some(parts) => {
+                    let mut expanded = Vec::new();
+                    for part in parts {
+                        expanded.extend(resolve(part, vocab_tokens, raw_parts, resolved));
+                    }
+                    expanded
+                }
+            };
+            resolved.insert(tok.to_vec(), out.clone());
+            out
+        }
+
+        for tok in raw_parts.keys() {
+            let out = resolve(tok, vocab_tokens, &raw_parts, &mut resolved);
+            self.deletion_parts.insert(tok.clone(), out);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Training methods
     // -----------------------------------------------------------------------
@@ -474,4 +549,70 @@ fn read_deletions<R: BufRead>(
     }
 
     Ok(deletions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pretokenize::Pretokenizer;
+
+    fn empty_inference_data() -> InferenceData {
+        let pretok = Pretokenizer::new(None, None, None, None).unwrap();
+        InferenceData::create_for_training(pretok)
+    }
+
+    /// Regression test for the PickyBPE double-deletion bug (case by Adam
+    /// Wiemerslage). Models the operation sequence:
+    ///   idx1 merge (c,r)->cr    idx3 delete cr ->[c,r]
+    ///   idx2 merge (cr,y)->cry  idx5 delete cry->[cr,y]  // references deleted cr
+    /// so `cry`'s recorded parts reference `cr`, which is itself deleted and not
+    /// in the final vocabulary. resolve_deletion_parts must expand it down to
+    /// in-vocab pieces (here single bytes).
+    #[test]
+    fn test_resolve_deletion_parts_double_deletion() {
+        let mut data = empty_inference_data();
+
+        // Raw parts as recorded at deletion time (the merge pair that created each).
+        data.deletion_parts
+            .insert(b"cr".to_vec(), vec![b"c".to_vec(), b"r".to_vec()]);
+        data.deletion_parts
+            .insert(b"cry".to_vec(), vec![b"cr".to_vec(), b"y".to_vec()]);
+
+        // Final vocab: cr and cry were deleted, so only single bytes remain here.
+        let vocab: ahash::AHashSet<Vec<u8>> =
+            [b"c".to_vec(), b"r".to_vec(), b"y".to_vec()].into_iter().collect();
+
+        data.resolve_deletion_parts(&vocab);
+
+        // cr resolves to its (in-vocab) bytes; cry must not leave a stray `cr`.
+        assert_eq!(data.get_replacement_parts(b"cr"), &[b"c".to_vec(), b"r".to_vec()]);
+        assert_eq!(
+            data.get_replacement_parts(b"cry"),
+            &[b"c".to_vec(), b"r".to_vec(), b"y".to_vec()]
+        );
+        // Every resolved piece is in the vocabulary.
+        for parts in data.deletion_parts.values() {
+            for p in parts {
+                assert!(vocab.contains(p), "unresolved piece {:?} not in vocab", p);
+            }
+        }
+    }
+
+    /// A deleted token whose part is still in the vocabulary is left as a
+    /// single in-vocab token, not needlessly expanded to bytes.
+    #[test]
+    fn test_resolve_deletion_parts_keeps_in_vocab_parts() {
+        let mut data = empty_inference_data();
+
+        // `ed` was deleted, splitting into `e` + `d`, both of which survive.
+        data.deletion_parts
+            .insert(b"ed".to_vec(), vec![b"e".to_vec(), b"d".to_vec()]);
+
+        let vocab: ahash::AHashSet<Vec<u8>> =
+            [b"e".to_vec(), b"d".to_vec()].into_iter().collect();
+
+        data.resolve_deletion_parts(&vocab);
+
+        assert_eq!(data.get_replacement_parts(b"ed"), &[b"e".to_vec(), b"d".to_vec()]);
+    }
 }

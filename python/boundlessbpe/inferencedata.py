@@ -112,6 +112,70 @@ class InferenceData:
         assert bad_token in self.deletion_parts, "couldn't find replacement parts for " + str(bad_token)
         return self.deletion_parts[bad_token]
 
+    def resolve_deletion_parts(self, vocab_tokens: set[bytes]) -> None:
+        r"""
+        Expand deletion_parts recursively so every replacement piece is in the vocabulary.
+
+        A token can be deleted more than once when a later merge recreates it (a
+        "double deletion"). When that happens the recorded replacement parts of one
+        deleted token may themselves reference another token that was deleted and is
+        no longer in the final vocabulary.
+
+        Example (tau small, blowup=False):
+
+            idx1 merge (c,r)->cr      idx3 delete cr  -> [c, r]
+            idx2 merge (cr,y)->cry    idx5 delete cry -> [cr, y]   # parts reference cr
+
+        Here ``cry`` records parts ``[cr, y]``, but ``cr`` was itself deleted at idx3 and
+        is not in the vocabulary. During encoding, ``prev_ind`` has already advanced past
+        the merge/deletion that would resolve ``cr`` (both have index < 5), so the stray
+        ``cr`` can never be turned into vocabulary tokens and ID lookup raises KeyError.
+
+        The only round-trippable interpretation under the monotonic-index algorithm is to
+        expand a deleted token's parts until every piece is in the vocabulary, bottoming
+        out at single bytes (which are always present). This is applied after loading and
+        repairs models that were trained before the fix.
+
+        Only blowup=False models can hit the bug. In blowup=False mode a deletion records
+        its *merge pair* as the replacement, and either half can be an intermediate
+        multi-byte token that was itself deleted (the ``cr`` above). In blowup=True mode a
+        deletion records the token's individual *bytes* — there is no intermediate token to
+        strand, and the recursion here bottoms out immediately. Termination and correctness
+        rest on the base-alphabet invariant: the 243 bytes that can appear in valid UTF-8
+        are never deleted (deleting one would make some valid text unencodable), so every
+        expansion is guaranteed to reach in-vocab pieces. This method is therefore a no-op
+        for blowup=True; it is still called for both so the invariant holds by construction
+        rather than by assumption.
+
+        Args:
+            vocab_tokens: The set of tokens present in the final vocabulary.
+        """
+        # Raw parts as recorded at deletion time (merge pair or single bytes).
+        raw_parts = dict(self.deletion_parts)
+        resolved: dict[bytes, list[bytes]] = {}
+
+        def resolve(tok: bytes) -> list[bytes]:
+            if tok in vocab_tokens:
+                return [tok]
+            if tok in resolved:
+                return resolved[tok]
+            # Cycle guard: parts are always strictly shorter than tok, so this
+            # recursion terminates, but memoize defensively before recursing.
+            resolved[tok] = [tok]
+            parts = raw_parts.get(tok)
+            if parts is None:
+                # Not a known deleted token yet not in vocab: fall back to bytes.
+                out = [bytes([b]) for b in tok]
+            else:
+                out = []
+                for part in parts:
+                    out.extend(resolve(part))
+            resolved[tok] = out
+            return out
+
+        for tok in raw_parts:
+            self.deletion_parts[tok] = resolve(tok)
+
     def trim_operations_to(self, num_ops: int) -> None:
         """
         Trim merges and deletions to keep only first num_ops operations.
