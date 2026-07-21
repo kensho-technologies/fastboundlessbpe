@@ -123,6 +123,26 @@ impl Tokenizer {
             );
         }
 
+        // Resolve deletion parts against the final vocabulary. This repairs
+        // "double deletion" cases where a deleted token's replacement parts
+        // reference another token that was itself deleted (see
+        // InferenceData::resolve_deletion_parts).
+        let vocab_tokens: AHashSet<Vec<u8>> = self
+            .vocab
+            .as_ref()
+            .expect("vocab must be loaded")
+            .token_to_id
+            .keys()
+            .cloned()
+            .collect();
+        self.words
+            .as_mut()
+            .expect("words must be loaded")
+            .resolve_deletion_parts(&vocab_tokens);
+        if let Some(superwords) = self.superwords.as_mut() {
+            superwords.resolve_deletion_parts(&vocab_tokens);
+        }
+
         // Set up possible superwords
         self.setup_superwords();
 
