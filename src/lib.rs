@@ -45,11 +45,11 @@ impl PyTokenizer {
     }
 
     /// Encode text to token IDs (ignoring special tokens)
-    #[pyo3(signature = (text, supercharge = true))]
-    fn encode_ordinary(&self, text: &str, supercharge: bool) -> PyResult<Vec<i32>> {
+    #[pyo3(signature = (text, supercharge = true, export_compatible = false))]
+    fn encode_ordinary(&self, text: &str, supercharge: bool, export_compatible: bool) -> PyResult<Vec<i32>> {
         let vocab = self.inner.vocab.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("vocab must be loaded"))?;
-        let tokens = self.inner.encode_ordinary_chunks(text, supercharge);
+        let tokens = self.inner.encode_ordinary_chunks(text, supercharge, export_compatible);
         let mut ids = Vec::with_capacity(tokens.len());
         for tok in &tokens {
             let id = vocab.token_to_id.get(tok)
@@ -62,24 +62,24 @@ impl PyTokenizer {
     }
 
     /// Encode text to token byte vectors
-    #[pyo3(signature = (text, supercharge = true))]
-    fn encode_ordinary_chunks(&self, text: &str, supercharge: bool) -> PyResult<Vec<Vec<u8>>> {
-        Ok(self.inner.encode_ordinary_chunks(text, supercharge))
+    #[pyo3(signature = (text, supercharge = true, export_compatible = false))]
+    fn encode_ordinary_chunks(&self, text: &str, supercharge: bool, export_compatible: bool) -> PyResult<Vec<Vec<u8>>> {
+        Ok(self.inner.encode_ordinary_chunks(text, supercharge, export_compatible))
     }
 
     /// Encode text with special token handling
-    #[pyo3(signature = (text, allowed_special = "none_raise"))]
-    fn encode(&self, text: &str, allowed_special: &str) -> PyResult<Vec<i32>> {
+    #[pyo3(signature = (text, allowed_special = "none_raise", export_compatible = false))]
+    fn encode(&self, text: &str, allowed_special: &str, export_compatible: bool) -> PyResult<Vec<i32>> {
         self.inner
-            .encode(text, allowed_special)
+            .encode(text, allowed_special, export_compatible)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Encode multiple texts at once
-    #[pyo3(signature = (texts, allowed_special = "none_raise"))]
-    fn encode_batch(&self, texts: Vec<&str>, allowed_special: &str) -> PyResult<Vec<Vec<i32>>> {
+    #[pyo3(signature = (texts, allowed_special = "none_raise", export_compatible = false))]
+    fn encode_batch(&self, texts: Vec<&str>, allowed_special: &str, export_compatible: bool) -> PyResult<Vec<Vec<i32>>> {
         self.inner
-            .encode_batch(&texts, allowed_special)
+            .encode_batch(&texts, allowed_special, export_compatible)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 

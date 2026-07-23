@@ -50,6 +50,8 @@ __all__ = [
     'SCRIPT_SPECIFIC_GPT4O_REGEX',
     'DEFAULT_SCRIPT_SPECIFIC_SCRIPTS',
     'WORD_LEVEL_REGEX',
+    'GPT4O_EXPORT_REGEX',
+    'GPT4O_COARSE_REGEX',
 ]
 
 from importlib.metadata import version, PackageNotFoundError

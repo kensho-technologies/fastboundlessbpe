@@ -43,6 +43,8 @@ Paper = "https://arxiv.org/abs/2604.05192"
 [project.optional-dependencies]
 test = ["pytest", "numpy"]
 dev = ["mypy"]
+# Exporting models to HuggingFace / tiktoken formats (Tokenizer.save_huggingface / save_tiktoken)
+export = ["tokenizers", "tiktoken"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
