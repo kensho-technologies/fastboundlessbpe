@@ -17,6 +17,7 @@ import regex
 from .util import frombytes, frombytespair, merge, blow_up
 from .inferencedata import InferenceData
 from .vocabulary import Vocabulary
+from .export import export_tiktoken, export_huggingface
 
 class Tokenizer():
 
@@ -186,12 +187,37 @@ class Tokenizer():
         """
         Load BoundlessBPE model from file. Auto-detects format.
 
-        File format (v2):
-        - Header: "BoundlessBPE v2 <model_type>"
-        - Vocabulary section
-        - Special tokens section
-        - Words section (config + merges + deletions)
-        - Superwords section (optional, for two-pass models)
+        The `.model` file is a unified v2 text format. The full layout (this method
+        reads the header and delegates each section to Vocabulary.load /
+        InferenceData.load)::
+
+            BoundlessBPE v2 <model_type>     # word | boundless | superbpe
+            vocabulary
+            <count>
+            <idx> <token> <count> <is_super>
+            ...
+            special_tokens
+            <count>
+            <idx> <token_string>
+            ...
+            words
+            <JSON config>                    # tau, is_super, regex patterns, etc.
+            merges
+            <count>
+            <idx> <left> <right> <count> <unlocked_flag>
+            ...
+            deletions
+            <count>
+            <idx> <token>
+            ...
+            superwords                       # only for boundless / superbpe models
+            <JSON config>
+            merges
+            ...
+            deletions
+            ...
+
+        Tokens are written in the byte-to-unicode encoding of util.frombytes.
 
         Args:
             model_file: Path to .model file (single-pass or two-pass unified format)
@@ -419,7 +445,7 @@ class Tokenizer():
         return result
 
     # do it all at once using FastBPE
-    def fast_supermerge(self, text_chunks: list[list[bytes]]) -> list[bytes]:
+    def fast_supermerge(self, text_chunks: list[list[bytes]], export_compatible: bool = False) -> list[bytes]:
 
         # If no superwords model, just flatten and return
         if not self.superwords:
@@ -428,66 +454,57 @@ class Tokenizer():
                 tokens.extend(chunk)
             return tokens
 
+        # A chunk can start/continue a supermerge run in one of two ways:
+        # - normal: it reduced to a single token that is a known supermerge participant.
+        # - export_compatible: its original pretoken is word-like (could_merge), even if
+        #   it reduced to several tokens. This reproduces what a plain single-pass BPE
+        #   does under the coarse "trick" regex — i.e. what save_tiktoken /
+        #   save_huggingface produce — and may apply supermerges normal inference would
+        #   not (see README "Exporting"). No coarse regex is needed: could_merge on the
+        #   model's own pretokens defines the same word runs.
         assert self.possible_superwords is not None, "possible_superwords must be initialized"
-        # flatten our list of chunks into a single list of tokens
+        assert self.words is not None, "words must be loaded"
+        possible_superwords = self.possible_superwords
+
+        # Precompute per-chunk run eligibility once, branching on the mode a single
+        # time rather than per chunk (this stays on the inference hot path):
+        # - normal: chunk reduced to a single known supermerge participant.
+        # - export_compatible: original pretoken is word-like (could_merge), even if it
+        #   reduced to several tokens — reproduces the exported tiktoken/HF tokenizer.
+        if export_compatible:
+            could_merge = self.words.pretokenizer.could_merge
+            eligible = [could_merge(b"".join(chunk)) for chunk in text_chunks]
+        else:
+            eligible = [len(chunk) == 1 and chunk[0] in possible_superwords
+                        for chunk in text_chunks]
+
         tokens = []
-
         i = 0
-        while i < len(text_chunks):
-            
-            # print("tc:", text_chunks[i])
-
-            # skip if not a single token or i not in possible superwords
-            if len(text_chunks[i]) > 1 or \
-                text_chunks[i][0] not in self.possible_superwords:
-                # print("not single:", text_chunks[i])
+        n = len(text_chunks)
+        while i < n:
+            if not eligible[i]:
                 tokens.extend(text_chunks[i])
-                i += 1 
+                i += 1
                 continue
 
-            # find the end of this run of the single chunks
-            j = i + 1  # beyond the range
-            while j < len(text_chunks) and len(text_chunks[j]) == 1\
-                and text_chunks[j][0] in self.possible_superwords:
-                # print("more:", i, j, text_chunks[j])
+            # find the end of this maximal run of supermerge-eligible chunks
+            j = i + 1
+            while j < n and eligible[j]:
                 j += 1
 
-            # if at least two then try a supermerge
+            # a lone eligible chunk can't supermerge (rules are whole-word pairs)
             if j == i + 1:
-                # just one in a row so can't supermerge
                 tokens.extend(text_chunks[i])
-                i += 1 
+                i += 1
                 continue
 
-            # this is a list of single pretokens
-            # TODO: remove this
-            for k in range(i,j):
-                # print("i,j,k", i, j, k, text_chunks[k], text_chunks[k][0] in self.possible_superwords)
-                assert len(text_chunks[k]) == 1
-                assert text_chunks[k][0] in self.possible_superwords
-
-            # note j is inclusive here and must be in range!!!!
-            assert len(text_chunks[j-1]) == 1
-
-            # get supermerge index here
-            for k in range(i,j-1):
-                pair = (text_chunks[k][0], text_chunks[k+1][0])
-                # print("pair", pair, self.superwords.merges_lookup.get(pair, -1))
-
-            # map these to the list of ids that merge_ids expexts
-            # merge_ids(self, ids: List[int])
-            # work with flattened list here, converting from List[List[bytes]]
-            before_tokens = [tc[0] for tc in text_chunks[i:j]]
-            # print("before_tokens:", before_tokens)
-
-            # now we just need to do the supermerges on the simplified list
-            merged_tokens = self.supermerge_tokens(before_tokens)
-
-            tokens.extend(merged_tokens)
-            # move to be j
+            # flatten the run's tokens and apply supermerges to the flat list
+            flat: list[bytes] = []
+            for k in range(i, j):
+                flat.extend(text_chunks[k])
+            tokens.extend(self.supermerge_tokens(flat))
             i = j
-
-        return tokens        
+        return tokens
     
     # find valid runs of supermerges, without doing the supermerges
     # this is used to aggregate chunks
@@ -569,7 +586,21 @@ class Tokenizer():
     # if blowup is True, then a deleted token is blown up into single bytes
     # as in our paper,  if False, then split into the pair that created it
     # as in the original paper.  This was used in the ablations
-    def encode_ordinary_chunks(self, text : str, supercharge : bool = True, verbose : bool = False) -> list[bytes]:
+    def encode_ordinary_chunks(self, text : str, supercharge : bool = True, verbose : bool = False, export_compatible : bool = False) -> list[bytes]:
+        """Encode text to a list of token byte strings, ignoring special tokens.
+
+        export_compatible (default False): a comparison/testing aid, not for normal use.
+        When True the supermerge step groups pretokens the way the coarse "trick" regex
+        does and supermerges the flattened run, so it reproduces the *supermerges* the
+        exported tiktoken / HuggingFace tokenizers make (see save_tiktoken /
+        save_huggingface) — including some normal BoundlessBPE would not, e.g. a
+        supermerge built from a pretoken fragment. This makes it much closer to the
+        exports than normal inference, but it is NOT byte-identical to them: regular
+        (non-super) merges here still stay within pretoken boundaries, whereas the
+        exports (plain single-pass BPE over one fused pretoken) can additionally make a
+        regular merge across a boundary. Use it to compare supermerge behavior against an
+        export; leave it False for real encoding.
+        """
         assert self.words is not None, "words must be loaded"
 
         if verbose:
@@ -585,9 +616,9 @@ class Tokenizer():
         # Apply all regular merges and deletions using the fast chunk-by-chunk approach
         self.fast_merge_delete(text_chunks, supercharge, verbose)
 
-        # do all the supermerges here now
-        # or just flatten if no self.superwords
-        tokens = self.fast_supermerge(text_chunks)
+        # do all the supermerges (or just flatten if no self.superwords);
+        # export_compatible reproduces the exported tiktoken/HuggingFace tokenizer
+        tokens = self.fast_supermerge(text_chunks, export_compatible=export_compatible)
 
         if verbose:
             print("tokens:", [frombytes(t) for t in tokens])
@@ -595,18 +626,27 @@ class Tokenizer():
         return tokens
 
     # finally do the integer lookup
-    def encode_ordinary(self, text: str, supercharge: bool = True) -> list[int]:
-        """Encoding that ignores any special tokens."""
-        assert self.vocab is not None, "vocab must be loaded"
-        return [self.vocab.token_to_id[tok] for tok in self.encode_ordinary_chunks(text, supercharge=supercharge)]
+    def encode_ordinary(self, text: str, supercharge: bool = True, export_compatible: bool = False) -> list[int]:
+        """Encode text to token ids, ignoring special tokens.
 
-    def encode(self, text: str, allowed_special: str = "none_raise") -> list[int]:
+        export_compatible (default False) is a testing aid that mimics the exported
+        tiktoken/HuggingFace tokenizers and will make some merges real BoundlessBPE would
+        not — see encode_ordinary_chunks. Leave it False for normal encoding.
+        """
+        assert self.vocab is not None, "vocab must be loaded"
+        return [self.vocab.token_to_id[tok]
+                for tok in self.encode_ordinary_chunks(text, supercharge=supercharge, export_compatible=export_compatible)]
+
+    def encode(self, text: str, allowed_special: str = "none_raise", export_compatible: bool = False) -> list[int]:
         """
         Unlike encode_ordinary, this function handles special tokens.
         allowed_special: can be "all"|"none"|"none_raise" or a custom set of special tokens
         if none_raise, then an error is raised if any special token is encountered in text
         this is the default tiktoken behavior right now as well
         any other behavior is either annoying, or a major footgun
+        export_compatible (default False) is a testing aid that more closely mimics the exported
+        tiktoken/HuggingFace tokenizers and will make some merges real BoundlessBPE would
+        not — see encode_ordinary_chunks. Leave it False for normal encoding.
         """
         # decode the user desire w.r.t. handling of special tokens
         assert self.vocab is not None, "vocab must be loaded"
@@ -624,7 +664,7 @@ class Tokenizer():
             raise ValueError(f"allowed_special={allowed_special} not understood")
         if not special:
             # shortcut: if no special tokens, just use the ordinary encoding
-            return self.encode_ordinary(text)
+            return self.encode_ordinary(text, export_compatible=export_compatible)
         # otherwise, we have to be careful with potential special tokens in text
         # we handle special tokens by splitting the text
         # based on the occurrence of any exact match with any of the special tokens
@@ -644,21 +684,23 @@ class Tokenizer():
                 ids.append(special[part])
             else:
                 # this is an ordinary sequence, encode it normally
-                ids.extend(self.encode_ordinary(part))
+                ids.extend(self.encode_ordinary(part, export_compatible=export_compatible))
         return ids
 
-    def encode_batch(self, texts: list[str], allowed_special: str = "none_raise") -> list[list[int]]:
+    def encode_batch(self, texts: list[str], allowed_special: str = "none_raise", export_compatible: bool = False) -> list[list[int]]:
         """
         Encode multiple texts at once (HuggingFace-compatible).
 
         Args:
             texts: List of texts to encode
             allowed_special: How to handle special tokens ("all"|"none"|"none_raise" or set)
+            export_compatible: If True, more closely match the exported tiktoken/HuggingFace tokenizer
+                (see encode_ordinary).
 
         Returns:
             List of token ID lists, one for each input text
         """
-        return [self.encode(text, allowed_special) for text in texts]
+        return [self.encode(text, allowed_special, export_compatible=export_compatible) for text in texts]
 
     def decode_batch(self, ids_list: list[list[int]]) -> list[str]:
         """
@@ -829,3 +871,41 @@ class Tokenizer():
             if self.superwords is not None:
                 f.write("superwords\n")
                 self.superwords._write_to_file(f)
+
+    def save_tiktoken(self, path: str, coarse_regex: Optional[str] = None) -> None:
+        """
+        Export this model to tiktoken format (a .tiktoken rank file + sidecar JSON).
+
+        Requires a model with no PickyBPE deletions and no script-aware pretokenizer.
+        For a superword (boundless/superbpe) model, `coarse_regex` is required — the
+        coarse "trick" regex that keeps mergeable runs as a single pretoken. For a
+        plain word model, `coarse_regex` must not be passed. See boundlessbpe.export.
+
+        Args:
+            path: Output path for the .tiktoken file (a `<path>.json` sidecar with
+                the pattern and special tokens is written alongside it).
+            coarse_regex: Coarse pretokenization regex (superword models only).
+        """
+        export_tiktoken(self, path, coarse_regex)
+
+    def save_huggingface(self, path: str, coarse_regex: Optional[str] = None) -> None:
+        """
+        Export this model to HuggingFace format into directory `path`.
+
+        Writes three files so the export loads both via
+        `tokenizers.Tokenizer.from_file(path/"tokenizer.json")` and via
+        `transformers.AutoTokenizer.from_pretrained(path)`:
+          - tokenizer.json         (the tokenizer, built with the `tokenizers` library)
+          - tokenizer_config.json  (tokenizer_class, special tokens, model_max_length)
+          - special_tokens_map.json
+        The config files are written by hand, so this does not require `transformers`.
+
+        Requires a model with no PickyBPE deletions and no script-aware pretokenizer.
+        For a superword (boundless/superbpe) model, `coarse_regex` is required; for a
+        plain word model it must not be passed. See boundlessbpe.export.
+
+        Args:
+            path: Output directory for the HuggingFace tokenizer files.
+            coarse_regex: Coarse pretokenization regex (superword models only).
+        """
+        export_huggingface(self, path, coarse_regex)

@@ -178,8 +178,9 @@ impl Tokenizer {
         for v in word_tokens {
             // Only consider valid UTF-8 tokens
             if let Ok(text) = std::str::from_utf8(v) {
-                // Encode without supercharge (we're computing the supercharge data)
-                let tokens = self.encode_ordinary_chunks(text, false);
+                // Encode without supercharge (we're computing the supercharge data);
+                // reachability uses normal (non-export) supermerging.
+                let tokens = self.encode_ordinary_chunks(text, false, false);
                 if tokens.len() == 1 {
                     reachable.insert(v.clone());
                 }
@@ -349,8 +350,15 @@ impl Tokenizer {
         result
     }
 
-    /// Find runs of possible superwords and apply supermerge_tokens to each run.
-    fn fast_supermerge(&self, text_chunks: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
+    /// Find supermerge-eligible runs and apply supermerge_tokens to each run.
+    ///
+    /// A chunk starts/continues a run in one of two ways:
+    /// - normal: it reduced to a single token that is a known supermerge participant.
+    /// - export_compatible: its original pretoken is word-like (`could_merge`), even if
+    ///   it reduced to several tokens. This reproduces what a plain single-pass BPE does
+    ///   under the coarse "trick" regex (i.e. the exported tiktoken/HuggingFace tokenizer)
+    ///   and may apply supermerges normal inference would not. No coarse regex is needed.
+    fn fast_supermerge(&self, text_chunks: &[Vec<Vec<u8>>], export_compatible: bool) -> Vec<Vec<u8>> {
         if self.superwords.is_none() {
             // No superwords model, just flatten
             return text_chunks.iter().flatten().cloned().collect();
@@ -360,42 +368,55 @@ impl Tokenizer {
             .possible_superwords
             .as_ref()
             .expect("possible_superwords must be initialized");
+        let words = self.words.as_ref().expect("words must be loaded");
+
+        // Precompute per-chunk run eligibility once, branching on the mode a single
+        // time rather than per chunk (mirrors the Python fast_supermerge):
+        // - normal: chunk reduced to a single known supermerge participant.
+        // - export_compatible: original pretoken is word-like (could_merge), even if it
+        //   reduced to several tokens — reproduces the exported tiktoken/HF tokenizer.
+        let eligible: Vec<bool> = if export_compatible {
+            text_chunks
+                .iter()
+                .map(|chunk| {
+                    let joined: Vec<u8> = chunk.iter().flatten().copied().collect();
+                    words.pretokenizer.could_merge(&joined)
+                })
+                .collect()
+        } else {
+            text_chunks
+                .iter()
+                .map(|chunk| chunk.len() == 1 && possible_superwords.contains(&chunk[0]))
+                .collect()
+        };
 
         let mut tokens = Vec::new();
         let mut i = 0;
 
         while i < text_chunks.len() {
-            // Skip if not a single token or not in possible superwords
-            if text_chunks[i].len() != 1
-                || !possible_superwords.contains(&text_chunks[i][0])
-            {
+            if !eligible[i] {
                 tokens.extend(text_chunks[i].iter().cloned());
                 i += 1;
                 continue;
             }
 
-            // Find end of run of single-token chunks that could be superwords
+            // Find end of the maximal run of eligible chunks
             let mut j = i + 1;
-            while j < text_chunks.len()
-                && text_chunks[j].len() == 1
-                && possible_superwords.contains(&text_chunks[j][0])
-            {
+            while j < text_chunks.len() && eligible[j] {
                 j += 1;
             }
 
-            // Need at least two consecutive candidates
+            // A lone eligible chunk can't supermerge (rules are whole-word pairs)
             if j == i + 1 {
                 tokens.extend(text_chunks[i].iter().cloned());
                 i += 1;
                 continue;
             }
 
-            // Extract single tokens from the run
+            // Flatten the run's tokens and apply supermerges to the flat list
             let before_tokens: Vec<Vec<u8>> = (i..j)
-                .map(|k| text_chunks[k][0].clone())
+                .flat_map(|k| text_chunks[k].iter().cloned())
                 .collect();
-
-            // Apply supermerges
             let merged = self.supermerge_tokens(&before_tokens);
             tokens.extend(merged);
 
@@ -468,7 +489,7 @@ impl Tokenizer {
     /// 2. Split each pretoken into individual bytes
     /// 3. Apply merge/deletion operations (fast_merge_delete)
     /// 4. Apply supermerges (fast_supermerge)
-    pub fn encode_ordinary_chunks(&self, text: &str, supercharge: bool) -> Vec<Vec<u8>> {
+    pub fn encode_ordinary_chunks(&self, text: &str, supercharge: bool, export_compatible: bool) -> Vec<Vec<u8>> {
         let words = self.words.as_ref().expect("words must be loaded");
 
         // Pretokenize
@@ -483,16 +504,19 @@ impl Tokenizer {
         // Apply all regular merges and deletions
         self.fast_merge_delete(&mut text_chunks, supercharge);
 
-        // Apply supermerges (or just flatten)
-        self.fast_supermerge(&text_chunks)
+        // Apply supermerges (or just flatten); export_compatible mirrors the exported
+        // tiktoken/HuggingFace tokenizer.
+        self.fast_supermerge(&text_chunks, export_compatible)
     }
 
     /// Encode text to token IDs (ignoring special tokens).
-    pub fn encode_ordinary(&self, text: &str) -> TokenizerResult<Vec<i32>> {
+    ///
+    /// `export_compatible`: if true, match the exported tiktoken/HuggingFace tokenizer.
+    pub fn encode_ordinary(&self, text: &str, export_compatible: bool) -> TokenizerResult<Vec<i32>> {
         let vocab = self.vocab.as_ref().ok_or_else(|| {
             TokenizerError::VocabularyError("vocab must be loaded".to_string())
         })?;
-        let tokens = self.encode_ordinary_chunks(text, true);
+        let tokens = self.encode_ordinary_chunks(text, true, export_compatible);
         let mut ids = Vec::with_capacity(tokens.len());
         for tok in &tokens {
             let id = vocab.token_to_id.get(tok).ok_or_else(|| {
@@ -509,14 +533,14 @@ impl Tokenizer {
     /// Encode text with special token handling.
     ///
     /// `allowed_special`: "all", "none", "none_raise"
-    pub fn encode(&self, text: &str, allowed_special: &str) -> TokenizerResult<Vec<i32>> {
+    pub fn encode(&self, text: &str, allowed_special: &str, export_compatible: bool) -> TokenizerResult<Vec<i32>> {
         let vocab = self.vocab.as_ref().ok_or_else(|| {
             TokenizerError::VocabularyError("vocab must be loaded".to_string())
         })?;
 
         let special: &ahash::AHashMap<String, i32> = match allowed_special {
             "all" => &vocab.special_tokens,
-            "none" => return self.encode_ordinary(text),
+            "none" => return self.encode_ordinary(text, export_compatible),
             "none_raise" => {
                 for special_token in vocab.special_tokens.keys() {
                     if text.contains(special_token.as_str()) {
@@ -526,7 +550,7 @@ impl Tokenizer {
                         )));
                     }
                 }
-                return self.encode_ordinary(text);
+                return self.encode_ordinary(text, export_compatible);
             }
             _ => {
                 return Err(TokenizerError::SpecialTokenError(format!(
@@ -537,7 +561,7 @@ impl Tokenizer {
         };
 
         if special.is_empty() {
-            return self.encode_ordinary(text);
+            return self.encode_ordinary(text, export_compatible);
         }
 
         // Split text by special tokens
@@ -574,7 +598,7 @@ impl Tokenizer {
             if let Some(&special_id) = special.get(part) {
                 ids.push(special_id);
             } else {
-                ids.extend(self.encode_ordinary(part)?);
+                ids.extend(self.encode_ordinary(part, export_compatible)?);
             }
         }
 
@@ -614,10 +638,11 @@ impl Tokenizer {
         &self,
         texts: &[&str],
         allowed_special: &str,
+        export_compatible: bool,
     ) -> TokenizerResult<Vec<Vec<i32>>> {
         texts
             .iter()
-            .map(|text| self.encode(text, allowed_special))
+            .map(|text| self.encode(text, allowed_special, export_compatible))
             .collect()
     }
 

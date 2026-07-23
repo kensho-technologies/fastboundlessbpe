@@ -53,3 +53,7 @@ Thumbs.db
 
 # Training data (download separately; see README)
 data/*.jsonl
+
+# Trained models and benchmark output (generated locally)
+models/
+export_benchmark*/

@@ -1,9 +1,13 @@
 # Copyright 2026-present Kensho Technologies, LLC.
 """Tests for the Pretokenizer class."""
 
+import regex
 import pytest
 from boundlessbpe.pretokenize import Pretokenizer
-from boundlessbpe.regexconstants import WORD_LEVEL_REGEX, SCRIPT_SPECIFIC_REGEX, DEFAULT_SCRIPT_SPECIFIC_SCRIPTS
+from boundlessbpe.regexconstants import (
+    WORD_LEVEL_REGEX, SCRIPT_SPECIFIC_REGEX, DEFAULT_SCRIPT_SPECIFIC_SCRIPTS,
+    GPT4O_EXPORT_REGEX, GPT4O_COARSE_REGEX,
+)
 
 
 # Test cases: (input_string, expected_tokens)
@@ -198,3 +202,40 @@ def test_pretokenize_reversible(pretokenizer: Pretokenizer, input_str: str, expe
     tokens = pretokenizer.pretokenize(input_str)
     back = "".join(tokens)
     assert input_str == back, f"Not reversible: {input_str!r} -> {tokens} -> {back!r}"
+
+
+# ---------------------------------------------------------------------------
+# Export regexes: GPT4O_EXPORT_REGEX (train with) and GPT4O_COARSE_REGEX
+# (export with). Key properties: apostrophes are word-internal ONLY (leading /
+# trailing ones split off as punctuation), and a leading run of N spaces splits
+# as (N-1) spaces + a single space attached to the following word.
+# ---------------------------------------------------------------------------
+
+# (input, fine expected, coarse expected)
+EXPORT_REGEX_TESTS = [
+    # A trailing/leading apostrophe must NOT attach to the word.
+    ("'hello'", ["'", "hello", "'"], ["'", "hello", "'"]),
+    ("aides'", ["aides", "'"], ["aides", "'"]),
+    # Internal apostrophes stay attached (contractions, names).
+    ("isn't", ["isn't"], ["isn't"]),
+    ("O'Brien", ["O'Brien"], ["O'Brien"]),
+    ("y'all", ["y'all"], ["y'all"]),
+    ("cafe's", ["cafe's"], ["cafe's"]),
+    # Leading spaces: N spaces -> (N-1) space token + 1 space on the word.
+    ("      hello", ["     ", " hello"], ["     ", " hello"]),
+    (" hello", [" hello"], [" hello"]),
+    ("hello", ["hello"], ["hello"]),
+    # Coarse groups a run of words into one pretoken; fine keeps them separate.
+    ("   hello world", ["  ", " hello", " world"], ["  ", " hello world"]),
+    ("don't stop", ["don't", " stop"], ["don't stop"]),
+]
+
+
+@pytest.mark.parametrize("text,fine,coarse", EXPORT_REGEX_TESTS)
+def test_export_regexes(text: str, fine: list[str], coarse: list[str]) -> None:
+    """GPT4O_EXPORT_REGEX / GPT4O_COARSE_REGEX apostrophe and leading-space behavior."""
+    assert regex.findall(GPT4O_EXPORT_REGEX, text) == fine, f"fine {text!r}"
+    assert regex.findall(GPT4O_COARSE_REGEX, text) == coarse, f"coarse {text!r}"
+    # Both partitions must be reversible.
+    assert "".join(fine) == text
+    assert "".join(coarse) == text

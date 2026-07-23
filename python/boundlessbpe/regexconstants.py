@@ -161,6 +161,73 @@ GPT4O_REGEX_PARTS = [
 # Joined version for convenience
 GPT4O_REGEX = "|".join(GPT4O_REGEX_PARTS)
 
+# ----------------------------------------------------------------------------
+# Export-friendly ("SuperBPE trick") regex pair.
+#
+# To export a superword (BoundlessBPE/SuperBPE) model to plain byte-level BPE
+# (HuggingFace / tiktoken), a coarser pretokenization regex must keep a whole run
+# of mergeable word-pretokens as a SINGLE pretoken, so single-pass BPE can rebuild
+# the cross-boundary supermerges. This requires training the model with a matching
+# FINE regex whose word branches compose cleanly into that coarse run.
+#
+# GPT4O_REGEX is not suitable as-is: its word branches allow a leading non-space
+# punctuation char and split contractions such as "isn't" -> ["isn", "'t"], which
+# makes coarse/fine pretoken boundaries disagree. GPT4O_EXPORT_REGEX below fixes
+# both: leading SPACE only, and apostrophes only BETWEEN letters (so "isn't" stays
+# one pretoken). GPT4O_COARSE_REGEX is the same, with the two word branches wrapped
+# in a repeatable group so consecutive words form one coarse pretoken.
+#
+# Train with GPT4O_EXPORT_REGEX; export with coarse_regex=GPT4O_COARSE_REGEX.
+#
+# NOTE (best effort): even with this pair, exported superword models are not always
+# byte-identical to BoundlessBPE. Fusing a run of pretokens into one coarse pretoken
+# lets plain single-pass BPE do two things BoundlessBPE never does:
+#
+#   1. Over-apply a supermerge whose part is really a fragment of a longer word.
+#      Text " are notes":   fine pretokens     [" are", " notes"]
+#                           after word merges   [[" are"], [" not", "es"]]
+#      The supermerge " are"+" not" exists, so BoundlessBPE could fire it — but it
+#      won't here, because " not" sits inside the " notes" pretoken's own list, not as a
+#      whole pretoken. The export, seeing one fused pretoken, applies it: [" are not", "es"].
+#
+#   2. Make a *regular* merge across a pretoken boundary. Text "ФичаДля" (Cyrillic
+#      camelCase) is two fine pretokens ["Фича", "Для"], each merged on its own list.
+#      In the fused coarse pretoken the last bytes of "Фича" and the first bytes of "Для"
+#      are adjacent, so a regular byte merge can bridge them — even splitting a multi-byte
+#      character mid-way. BoundlessBPE never lets a regular merge cross a pretoken boundary.
+#
+# Decoded text is always identical; only the segmentation differs. The two cases have very
+# different frequencies:
+#   - Case 1 is common: any text with a supermerge participant that is also a word prefix
+#     hits it. In one test it affected a substantial fraction of documents (~a quarter had
+#     at least one such spot). This is the main way the export differs from BoundlessBPE.
+#   - Case 2 is rare and confined to no-separator runs (camelCase, joined non-Latin scripts).
+# Tokenizer(...).encode_*(export_compatible=True) reproduces case 1 but NOT case 2, so it
+# agrees with the export except on case 2 — fewer than 1 in 30,000 docs on 1M mixed text.
+# (That 1-in-30,000 is the export_compatible-vs-export gap, i.e. case 2 only; the overall
+# export-vs-BoundlessBPE difference is much larger, driven by case 1.)
+# For exact BoundlessBPE behavior, use the boundlessbpe tokenizer directly.
+
+# Word branches: leading space only; internal-only straight/curly apostrophes.
+_EXPORT_WORD_1 = r" ?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:['’](?:\p{L}\p{M}*)+)*"
+_EXPORT_WORD_2 = r" ?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:['’](?:\p{L}\p{M}*)+)*"
+
+_EXPORT_REST = [
+    r"\p{N}{1,3}",
+    r" ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"\s*[\r\n]+",
+    r"\s+(?!\S)",
+    r"\s+",
+]
+
+# Fine regex to TRAIN an exportable model with (drop-in for GPT4O_REGEX).
+GPT4O_EXPORT_REGEX = "|".join([_EXPORT_WORD_1, _EXPORT_WORD_2] + _EXPORT_REST)
+
+# Coarse regex to EXPORT a model trained with GPT4O_EXPORT_REGEX: word branches
+# grouped so a run of consecutive words becomes one pretoken.
+_EXPORT_WORD_GROUP = "(?:" + _EXPORT_WORD_1 + "|" + _EXPORT_WORD_2 + ")+"
+GPT4O_COARSE_REGEX = "|".join([_EXPORT_WORD_GROUP] + _EXPORT_REST)
+
 # GPT4O pattern parts as a list for reuse
 SCRIPT_SPECIFIC_GPT4O_REGEX_PARTS = [
     r" ?\p{L}\p{M}*",
